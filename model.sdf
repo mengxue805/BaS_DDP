@@ -1,6 +1,6 @@
 <?xml version='1.0'?>
 <sdf version='1.7'>
-  <model name='box1'>
+  <model name='box2'>
     <link name='link'>
       <inertial>
         <mass>1</mass>
@@ -22,7 +22,7 @@
       <visual name='visual'>
         <geometry>
           <box>
-            <size>0.05 0.05 0.05</size>
+            <size>0.1 0.1 0.1</size>
           </box>
         </geometry>
         <material>
@@ -48,7 +48,7 @@
         <pose>0 0 0 0 -0 0</pose>
         <geometry>
           <box>
-            <size>0.05 0.05 0.05</size>
+            <size>0.1 0.1 0.1</size>
           </box>
         </geometry>
         <surface>
