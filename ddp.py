@@ -1,292 +1,231 @@
-from time import time
-import logging
 import numpy as np
-from numpy.linalg import inv
-import sympy as sym
-from sympy import lambdify
-
-from collections.abc import Callable
-from numpy.typing import ArrayLike
+import jax.numpy as jnp
+from functools import wraps
+import time
 
 
-class DDPOptimizer:
-    """Finite horizon Discrete-time Differential Dynamic Programming(DDP)"""
+class DDP:
+    def __init__(self, n, m, Ts, f, f_x, f_u, f_xx, f_uu, f_xu, f_ux, l_x, l_u, l_xx, l_uu, lf_x, lf_xx, cost):
+        self.n = n  # Number of states
+        self.m = m  # Number of controls
+        self.Ts = Ts
+        self.f = f  # Discrete dynamics
+        self.f_x = f_x
+        self.f_u = f_u
+        self.f_xx = f_xx
+        self.f_uu = f_uu
+        self.f_xu = f_xu
+        self.f_ux = f_ux
+        self.l_x = l_x
+        self.l_u = l_u
+        self.l_xx = l_xx
+        self.l_uu = l_uu
+        self.lf_x = lf_x
+        self.lf_xx = lf_xx
+        self.cost = cost  # Objective function cost
 
-    def __init__(
-        self,
-        Nx: int,
-        Nu: int,
-        dynamics: Callable,
-        inst_cost: Callable,
-        terminal_cost: Callable,
-        tolerance: float = 1e-5,
-        max_iters: int = 200,
-        with_hessians: bool = False,
-        constrain: bool = False,
-        alphas: ArrayLike = [1.0],
-    ):
+        self.N = None  # Number of timesteps
+        self.eps = 1e-3  # Tolerance
+        self.max_iter = 50  # Maximum iterations for DDP
+        self.max_iter_reg = 10  # Maximum iterations for regularization
+        self.backward_total_time = 0
+        self.temp_time = 0
+        self.count = 0
+
+    def run_DDP(self, x0, u_traj, N, barry, r, Type):
         """
-        Instantiates a DDP Optimizer and pre-computes the dynamics
-        and cost derivates without doing any optimization/solving.
-
-        :param Nx: dimension of the state variable x
-        :param Nu: dimension of the control variable u
-        :param dynamics: a callable dynamics function with 3 arguments
-            x, u, constrain. This function must be closed-form differentiable
-            by sympy. In other words, it must be built with sympy and/or numpy.
-            Has to return the next state x' with same dimensions as input state.
-        :param inst_cost: instantenious (aka running) cost funciton. Must be a
-            callable function with 3 arguments x, u, x_goal. Again, must be
-            closed-form differentiatable by sympy.
-        :param term_cost: terminal cost funciton. Must be a
-            callable function with 3 arguments x, u, x_goal. Again, must be
-            closed-form differentiatable by sympy.
-        :param tolerance: tolerance for convergence. Since DDP does multiple
-            runs to optimize a trajectory, we add a tolerance at which optimizing
-            further doesn't gain us benfits.
-        :param max_iters: maximum number of optimization iterations to perform
-        :param with_hessians: if true, does the complete DDP optimization including
-            the hessians of the dynamics. This is the complete form of the original
-            algorithm but often the computational cost of computing these hessians
-            are not worth convergence rate increase.
-        :param constrain: whether to constrain the dynamics
-        :param alphas: list of backtracking coefficients. Must be <=0 and in
-            decreasing order. The length of the list designates the number
-            of backtracking attempts. A common configuration is
-            `1.1 ** (-np.arange(10) ** 2)`. Backtracking often helps but
-            is not necessary to obtain good solutions. To not use backtracking
-            just leave at default [1.0]
+        Runs the iLQR or DDP algorithm.
+        Inputs:
+          - x0(np.ndarray):     The current state            [nx1]
+          - u_traj(np.ndarray): The current control solution [mxN]
+          - N(int):             Try path for N times        [int]
+        Returns:
+          - x_traj(np.ndarray): The states trajectory        [nxN]
+          - u_traj(np.ndarray): The controls trajectory      [mxN]
+          - J(float):           The optimal cost
         """
-        assert tolerance > 0
-        assert max_iters > 0
+        print("DDP beginning..")
+        self.N = N
 
-        self.Nx = Nx
-        self.Nu = Nu
-        self.tolerance = tolerance
-        self.max_iters = max_iters
-        self.with_hessians = with_hessians
-        self.constrain = constrain
-        self.alphas = alphas
+        # Initial Rollout
+        x_traj = np.zeros((self.n, self.N))
+        x_traj[:, 0] = x0
 
-        # Pre-compute derivatives now so that we don't have to do it every time
-        x = sym.symbols("x:{:}".format(Nx))
-        x = sym.Matrix([xi for xi in x])
-        u = sym.symbols("u:{:}".format(Nu))
-        u = sym.Matrix([ui for ui in u])
-        x_goal = sym.symbols("x_g:{:}".format(Nx))
-        x_goal = sym.Matrix([xi for xi in x_goal])
+        for k in range(self.N - 1):
+            x_traj[:, k + 1] = self.f(x_traj[:, k], u_traj[:, k], barry, r)
+        J = self.cost(x_traj, u_traj)
 
-        # dynamics
-        self.f = lambdify((x, u), dynamics(x, u, constrain))
-        self.fx = lambdify((x, u), dynamics(x, u, constrain).jacobian(x))
-        self.fu = lambdify((x, u), dynamics(x, u, constrain).jacobian(u))
-        jac = dynamics(x, u).jacobian(x)
-        self.fxx = lambdify((x, u), [jac.row(i).jacobian(x) for i in range(Nx)])
-        jac = dynamics(x, u).jacobian(u)
-        self.fux = lambdify((x, u), [jac.row(i).jacobian(x) for i in range(Nx)])
-        jac = dynamics(x, u).jacobian(u)
-        self.fuu = lambdify((x, u), [jac.row(i).jacobian(u) for i in range(Nx)])
+        # Initialize DDP matrices
+        p = np.ones((self.n, self.N))  # p 通常用于存储每个时间步的代价函数关于状态的梯度。
+        P = np.zeros((self.n, self.n, self.N))  # P 通常用于存储每个时间步的代价函数关于状态的Hessian矩阵（也就是二阶梯度）。
+        d = np.ones((self.N - 1, self.m))  # d 通常用于存储每个时间步的控制更新。
+        K = np.zeros((self.m, self.n, self.N - 1))  # K 通常用于存储每个时间步的反馈控制增益。
 
-        # costs
-        self.g = lambdify((x, u, x_goal), inst_cost(x, u, x_goal))
-        self.gx = lambdify((x, u, x_goal), inst_cost(x, u, x_goal).jacobian(x))
-        self.gu = lambdify((x, u, x_goal), inst_cost(x, u, x_goal).jacobian(u))
-        self.gxx = lambdify(
-            (x, u, x_goal), inst_cost(x, u, x_goal).jacobian(x).jacobian(x)
-        )
-        self.gux = lambdify(
-            (x, u, x_goal), inst_cost(x, u, x_goal).jacobian(u).jacobian(x)
-        )
-        self.guu = lambdify(
-            (x, u, x_goal), inst_cost(x, u, x_goal).jacobian(u).jacobian(u)
-        )
-        self.h = lambdify((x, x_goal), terminal_cost(x, x_goal))
-        self.hx = lambdify((x, x_goal), terminal_cost(x, x_goal).jacobian(x))
-        self.hxx = lambdify(
-            (x, x_goal), terminal_cost(x, x_goal).jacobian(x).jacobian(x)
-        )
+        itr = 0
+        prev_err = np.inf
+        err_diff = np.inf
+        #while itr < self.max_iter:
+        while np.linalg.norm(d, np.inf) > self.eps and itr < self.max_iter and err_diff > 1e-3:
+            # Backward Pass
+            backward_start_time = time.time()
+            DJ, p, P, d, K = self.backward_pass(p, P, d, K, x_traj, u_traj, barry, r, Type)
+            self.backward_total_time += time.time() - backward_start_time
+            # print("Backward pass took: {} seconds".format(time.time() - backward_start_time))
+            # Forward rollout with line search
+            x_new, u_new, Jn = self.rollout_with_linesearch(x_traj, u_traj, d, K, J, DJ, barry, r)
 
-    def optimize(
-        self,
-        x0: ArrayLike,
-        x_goal: ArrayLike,
-        N: int = None,
-        U0: ArrayLike = None,
-        full_output: bool = False,
-    ):
+            # Update values
+            J = Jn
+            x_traj = x_new
+            u_traj = u_new
+            itr += 1
+            err_diff = abs(np.linalg.norm(d, np.inf) - prev_err)
+            prev_err = np.linalg.norm(d, np.inf)
+
+            if itr % 10 == 0:
+                print("Iteration: {}, J = {}".format(itr, J))
+
+        print("\nDDP took: {} iterations".format(itr))
+        return x_traj, u_traj, J, itr
+
+    def backward_pass(self, p, P, d, K, x_traj, u_traj, barry, r, Type):
+        """Performs a backward pass to update values."""
+        DJ = 0.0
+        p[:, self.N - 1] = self.lf_x(x_traj[:, self.N - 1].reshape(-1, 1))[:, 0]
+        P[:, :, self.N - 1] = self.lf_xx()
+        # V_x = self.l_x(x_traj[:, 9])[-1]
+        self.count += 1
+
+        A_temp = np.zeros((self.N - 1, self.n, self.n))
+        
+        # for k in range(self.N - 2, -1, -1):
+        #     A = self.f_x(x_traj[:, k], u_traj[:, k], barry, r)
+        #     A_temp[k] = A
+        
+
+        for k in range(self.N - 2, -1, -1):
+            # Compute derivatives
+            A = self.f_x(x_traj[:, k], u_traj[:, k], barry, r)
+            B = self.f_u(x_traj[:, k], u_traj[:, k], barry, r)  
+
+            gx = self.l_x(x_traj[:, k]) + A.T @ p[:, k + 1]  # (n,)
+            gu = self.l_u(u_traj[:, k]) + B.T @ p[:, k + 1]  # (m,)
+            
+
+            # # iLQR (Gauss-Newton) version
+            # # ------------------------------------------------------------------
+            if Type == 'ILQR':
+                Gxx = self.l_xx() + np.dot(np.dot(A.T, P[:, :, k + 1]), A)  # nxn
+                Guu = self.l_uu() + np.dot(np.dot(B.T, P[:, :, k + 1]), B)  # mxm
+                Gxu = np.dot(A.T, np.dot(P[:, :, k + 1], B))  # nxm
+                Gux = np.dot(B.T, np.dot(P[:, :, k + 1], A))  # mxn
+                
+
+            # DDP (full Newton) version
+            # ------------------------------------------------------------------
+            if Type == 'DDP':
+                Ax = self.f_xx(x_traj[:, k], u_traj[:, k], barry, r)  # nnxn
+                Bx = self.f_ux(x_traj[:, k], u_traj[:, k], barry, r)  # nxn
+                Au = self.f_xu(x_traj[:, k], u_traj[:, k], barry, r)  # nnxm
+                Bu = self.f_uu(x_traj[:, k], u_traj[:, k], barry, r)  # (n,)
+
+                Gxx = self.l_xx() + A.T @ P[:, :, k + 1] @ A + jnp.tensordot(p[:, k + 1], Ax, axes=1)  # nxn
+                Guu = self.l_uu() + B.T @ P[:, :, k + 1] @ B + jnp.tensordot(p[:, k + 1], Bu, axes=1)  # mxm
+                Gxu = A.T @ P[:, :, k + 1] @ B + jnp.tensordot(p[:, k + 1], Au, axes=1)  # nxm
+                Gux = B.T @ P[:, :, k + 1] @ A + jnp.tensordot(p[:, k + 1], Bx, axes=1)  # mxn
+
+
+                # Regularization
+                beta = 0.1
+                G = np.block([[Gxx, Gxu],
+                              [Gux, Guu]])
+                iter_reg = 0
+                temp = time.time()
+                self.is_pos_def(G)
+                self.temp_time += time.time() - temp
+                while not self.is_pos_def(G) and iter_reg < self.max_iter_reg:
+                    Gxx += beta * A.T @ A
+                    Guu += beta * B.T @ B
+                    Gxu += beta * A.T @ B
+                    Gux += beta * B.T @ A
+                    beta = 2 * beta
+                    # print("regularizing G")
+                    iter_reg += 1
+                # print("Regularization time: ", time.time() - temp)
+                
+            # ------------------------------------------------------------------
+            d[k, :], _, _, _ = jnp.linalg.lstsq(Guu, gu, rcond=None)
+            K[:, :, k], _, _, _ = jnp.linalg.lstsq(Guu, Gux, rcond=None)
+            # p[:, k] = gx - K[:, :, k].T @ gu + (K[:, :, k].T @ Guu @ d[k, :].T).reshape(self.n, ) - (
+            #         Gxu @ d[k, :].T).reshape(self.n, )
+            # P[:, :, k] = Gxx + K[:, :, k].T @ Guu @ K[:, :, k] - Gxu @ K[:, :, k] - K[:, :, k].T @ Gux
+
+            p[:, k] = gx + (K[:, :, k].T @ Guu @ d[k, :].T).reshape(self.n, ) - K[:, :, k].T @ gu - (
+                    Gux.T @ d[k, :]).reshape(self.n, )
+
+            P[:, :, k] = Gxx + K[:, :, k].T @ Guu @ K[:, :, k] - K[:, :, k].T @ Gux - Gux.T @ K[:, :, k]
+            # P[:, :, k] = 0.5*(P[:, :, k] + P[:, :, k].T)
+
+            DJ += gu.T @ d[k, :].T
+
+        return DJ, p, P, d, K  # d = k
+
+
+    @staticmethod
+    def is_pos_def(A):
+        """Check if matrix A is positive definite.
+
+        If symmetric and has Cholesky decomposition -> p.d.
         """
-        Optimize a trajectory given a starting state and a goal state.
-        Optimization is performed until convergence or until we run out
-        of the maximum number of iterations. If the latter happesn, that
-        means that the trajectory is suboptimal and there likely is something
-        wrongly configured.
-        Note that the lenght of the trajectory is decided based on the args.
-
-        :param x0: starting state. Must be of dimensions (Nx,1)
-        :param x_goal: goal state. Must be of dimensions (Nx,1)
-        :param N: trajectory lenght. If provided, the optimizer generates
-            a random initial control sequence. This is called "slow start"
-            and often results in poor optimization time (>1s)
-        :param U0: initial control sequence. Must be of dimensions (N,Nu)
-            where the N is the implied trajectory lenght. If provided this
-            will be used to "warm start" the optimization, resulting in
-            faster convergence rates (if the warm start is good)
-        :param full_output: By default this function returns only the
-            optimal state and control sequences. If full_output=True
-            it also returns (optimal state sequence, optimal control sequence,
-            state sequence history, control sequence history, total cost history)
-        """
-
-        if not N and not U0:
-            print(
-                "ERROR: You have to provide either trajectory length N or initial control sequency U0"
-            )
-            return
-
-        start = time()
-        x0 = np.array(x0)
-        x_goal = np.array(x_goal)
-        done = False
-
-        # figure out initial control sequence
-        if U0:
-            N = len(U0) + 1
-            U = np.array(U0)
+        if np.allclose(A, A.T, rtol=1e-04, atol=1e-04):  # Ensure it is symmetric
+            try:
+                np.linalg.cholesky(A)
+                return True
+            except np.linalg.LinAlgError:
+                return False
         else:
-            assert N > 0
-            U = np.random.uniform(-1.0, 1.0, (N, self.Nu))
+            return False
 
-        # Definte total cost of trajectory function
-        # Note: defined here to give the flexibility of parameteraising
-        #   x_goal on the fly
-        def J(X, U):
-            total_cost = 0.0
-            for i in range(len(U)):
-                total_cost += self.g(X[i], U[i], x_goal)
-            total_cost += self.h(X[-1], x_goal)
-            return float(total_cost)
 
-        # rollout initial trajectory
-        X = np.zeros((N + 1, self.Nx))
-        X[0] = x0
-        for i in range(len(U)):
-            X[i + 1] = self.f(X[i], U[i]).flatten()
+    def rollout(self, x_traj, u_traj, d, K, a, barry, r):
+        """Forward rollout."""
+        x_new = np.zeros((self.n, self.N))
+        u_new = np.zeros((self.m, self.N - 1))
+        x_new[:, 0] = x_traj[:, 0]
 
-        last_cost = J(X, U)
+        for k in range(self.N - 1):
+            diff = x_new[:, k] - x_traj[:, k]
+            u_new[:, k] = u_traj[:, k] - a * d[k] - K[:, :, k] @ diff
+            u_new[:, k] = np.clip(u_new[:, k], -20, 40)
+            x_new[:, k + 1] = self.f(x_new[:, k], u_new[:, k], barry, r)
 
-        # keep a history of the trajectory
-        if full_output:
-            X_hist = [X.copy()]
-            U_hist = [U.copy()]
-            cost_hist = [last_cost]
+        J_new = self.cost(x_new, u_new)
+        return x_new, u_new, J_new
 
-        # Start optimization
-        logging.info("Starting DDP optimization with J={:.2f}".format(last_cost))
-        for i in range(self.max_iters):
+    # @timeit
+    def rollout_with_linesearch(self, x_traj, u_traj, d, K, J, DJ, barry, r):
+        """Forward rollout with linesearch to find best step size."""
+        a = 1.0  # Step size
+        b = 1e-8  # Armijo tolerance
+        armijo_scale = b * DJ
+        x_new, u_new, Jn = self.rollout(x_traj, u_traj, d, K, a, barry, r)
 
-            # Backwards pass
-            Vx = self.hx(X[-1], x_goal).flatten()
-            assert Vx.shape == (self.Nx,)
-            Vxx = self.hxx(X[-1], x_goal)
-            assert Vxx.shape == (self.Nx, self.Nx)
+        while Jn > (J -  a * armijo_scale):
+            a *= 0.1
+            x_new, u_new, Jn = self.rollout(x_traj, u_traj, d, K, a, barry, r)
 
-            # Create buffers for Q derivatives
-            Qus = np.zeros((N, self.Nu))
-            Quus = np.zeros((N, self.Nu, self.Nu))
-            Quxs = np.zeros((N, self.Nu, self.Nx))
-            for t in reversed(range(N)):
-                gx = self.gx(X[t], U[t], x_goal).flatten()
-                assert gx.shape == (self.Nx,)
-                gu = self.gu(X[t], U[t], x_goal).flatten()
-                assert gu.shape == (self.Nu,)
-                gxx = self.gxx(X[t], U[t], x_goal)
-                assert gxx.shape == (self.Nx, self.Nx)
-                gux = self.gux(X[t], U[t], x_goal)
-                assert gux.shape == (self.Nu, self.Nx)
-                guu = self.guu(X[t], U[t], x_goal)
-                assert guu.shape == (self.Nu, self.Nu)
-                fx = self.fx(X[t], U[t])
-                assert fx.shape == (self.Nx, self.Nx)
-                fu = self.fu(X[t], U[t])
-                assert fu.shape == (self.Nx, self.Nu)
+        return x_new, u_new, Jn
 
-                if self.with_hessians:
-                    fxx_e = np.array(self.fxx(X[t], U[t]))
-                    assert fxx_e.shape == (self.Nx, self.Nx, self.Nx)
-                    fux_e = np.array(self.fux(X[t], U[t]))
-                    assert fux_e.shape == (self.Nx, self.Nu, self.Nx)
-                    fuu_e = np.array(self.fuu(X[t], U[t]))
-                    assert fuu_e.shape == (self.Nx, self.Nu, self.Nu)
 
-                Qx = gx + fx.T @ Vx
-                assert Qx.shape == (self.Nx,)
-                Qu = gu + fu.T @ Vx
-                assert Qu.shape == (self.Nu,)
-                Qxx = gxx + fx.T @ Vxx @ fx
-                assert Qxx.shape == (self.Nx, self.Nx)
-                Quu = guu + fu.T @ Vxx @ fu
-                assert Quu.shape == (self.Nu, self.Nu)
-                Qux = gux + fu.T @ Vxx @ fx
-                assert Qux.shape == (self.Nu, self.Nx)
+    @staticmethod
+    def comm_mat(m, n):
+        """Commutation matrix.
 
-                if self.with_hessians:
-                    Qxx += np.tensordot(Vx, fxx_e, axes=1)
-                    Quu += np.tensordot(Vx, fuu_e, axes=1)
-                    Qux += np.tensordot(Vx, fux_e, axes=1)
-
-                # store Q derivatives for forward pass
-                Qus[t] = Qu
-                Quus[t] = Quu
-                Quxs[t] = Qux
-
-                Quu_inv = inv(Quu)
-                Vx = Qx - Qux.T @ Quu_inv @ Qu
-                assert Vx.shape == (self.Nx,)
-                Vxx = Qxx - Qux.T @ Quu_inv @ Qux
-                assert Vxx.shape == (self.Nx, self.Nx)
-
-            # forward pass with backtracking
-            for k, alpha in enumerate(self.alphas):
-                X_star = np.zeros_like(X)
-                U_star = np.zeros_like(U)
-                X_star[0] = X[0].copy()
-                for t in range(N):
-                    error = X_star[t] - X[t]
-                    U_star[t] = U[t] - inv(Quus[t]) @ (alpha * Qus[t] + Quxs[t] @ error)
-                    X_star[t + 1] = self.f(X_star[t], U_star[t]).flatten()
-
-                # update cost metric to see if we're doing well
-                total_cost = J(X_star, U_star)
-                if total_cost < last_cost:
-                    logging.info(
-                        "Accepting new solution with J={:} alpha={:.2f} and {:} backtracks".format(
-                            total_cost, alpha, k
-                        )
-                    )
-                    X = X_star
-                    U = U_star
-                    break
-
-                if alpha == self.alphas[-1]:
-                    logging.warn("Reached final alpha")
-                    done = True
-
-            if full_output:
-                X_hist.append(X.copy())
-                U_hist.append(U.copy())
-                cost_hist.append(total_cost)
-
-            # check for convergence at the end of the optimization cylcle
-            if done or abs(last_cost - total_cost) < self.tolerance:
-                break
-            last_cost = total_cost
-
-        time_taken = time() - start
-        logging.info("Converged in {:}/{:} iterations".format(i, self.max_iters))
-        logging.info("Total optimzation time {:.2f}".format(time_taken))
-        logging.info("Final trajectory cost J={:.2f}".format(total_cost))
-
-        if full_output:
-            return X, U, X_hist, U_hist, cost_hist
-
-        return X, U
+        Used to transform the vectorized form of a matrix into the vectorized
+        form of its transpose.
+        Inputs:
+          - m(int): Number of rows
+          - n(int): Number of columns
+        """
+        w = np.arange(m * n).reshape((m, n), order="F").T.ravel(order="F")
+        return np.eye(m * n)[w, :]
